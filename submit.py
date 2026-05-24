@@ -29,8 +29,9 @@ from torch.utils.data import DataLoader
 from torch.amp import autocast
 from tqdm import tqdm
 import requests
+import torchvision.transforms as T
 
-from dataset import FolderImageDataset, get_val_transforms
+from dataset import FolderImageDataset
 from model import CLIPArcFaceModel
 from rerank import rerank_topk
 
@@ -60,6 +61,10 @@ def load_model(checkpoint_path: str, device: torch.device) -> CLIPArcFaceModel:
     return model
 
 
+def identity_collate(batch):
+    return batch
+
+
 @torch.no_grad()
 def extract_embeddings(
     model: CLIPArcFaceModel,
@@ -71,20 +76,41 @@ def extract_embeddings(
     Extract L2-normalised embeddings for all images in `folder`.
     Returns (embeddings [N, D], filenames [N]).
     """
-    dataset = FolderImageDataset(folder, transform=get_val_transforms(224))
+    image_size = 224
+    num_tta_views = 6
+    tta_transform = T.Compose([
+        T.RandomResizedCrop(image_size, scale=(0.75, 1.0), ratio=(0.9, 1.1)),
+        T.RandomHorizontalFlip(p=0.5),
+        T.ToTensor(),
+        T.Normalize(mean=(0.48145466, 0.4578275, 0.40821073),
+                    std=(0.26862954, 0.26130258, 0.27577711)),
+    ])
+
+    dataset = FolderImageDataset(folder, transform=None)
     loader  = DataLoader(
         dataset, batch_size=batch_size,
         shuffle=False, num_workers=6, pin_memory=True,
+        collate_fn=identity_collate,
     )
 
     all_embeddings = []
     all_filenames  = []
 
-    for images, fnames in tqdm(loader, desc=f"Embedding {os.path.basename(folder)}"):
-        images = images.to(device, non_blocking=True)
-        with autocast(device_type=device.type):
-            emb = model.encode(images)
-        all_embeddings.append(emb.float().cpu())
+    for batch in tqdm(loader, desc=f"Embedding {os.path.basename(folder)}"):
+        images, fnames = zip(*batch)
+
+        view_embeddings = []
+        for _ in range(num_tta_views):
+            view_batch = torch.stack([tta_transform(image) for image in images])
+            view_batch = view_batch.to(device, non_blocking=True)
+            with autocast(device_type=device.type):
+                emb = model.encode(view_batch)
+            view_embeddings.append(emb.float())
+
+        emb = torch.stack(view_embeddings, dim=0).mean(dim=0)
+        emb = F.normalize(emb, dim=1)
+
+        all_embeddings.append(emb.cpu())
         all_filenames.extend(fnames)
 
     return torch.cat(all_embeddings, dim=0), all_filenames
