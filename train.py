@@ -18,7 +18,8 @@ import time
 from pathlib import Path
 
 import torch
-from torch.utils.data import DataLoader, random_split
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, Subset, WeightedRandomSampler, random_split
 from torch.amp import GradScaler, autocast
 
 from dataset import CelebRetrievalDataset, get_train_transforms, get_val_transforms
@@ -53,6 +54,79 @@ def cosine_lr_schedule(optimizer, epoch: int, total_epochs: int,
 
     optimizer.param_groups[0]["lr"] = base_lr_backbone * factor
     optimizer.param_groups[1]["lr"] = base_lr_head    * factor
+
+
+def make_epoch_loader(dataset, batch_size: int, num_workers: int,
+                      sampler=None):
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=sampler is None,
+        sampler=sampler,
+        num_workers=num_workers,
+        pin_memory=True,
+        drop_last=True,
+    )
+
+
+@torch.no_grad()
+def build_hard_negative_sampler(model, mining_loader, device, knn_k: int = 5,
+                                 hardness_scale: float = 2.0):
+    """Build a weighted sampler that oversamples identities close to others."""
+    model.eval()
+
+    all_embeddings = []
+    all_labels = []
+
+    for images, labels in mining_loader:
+        images = images.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
+        with autocast(device_type=device.type):
+            emb = model.encode(images)
+        all_embeddings.append(emb.float().cpu())
+        all_labels.append(labels.cpu())
+
+    embeddings = torch.cat(all_embeddings, dim=0)
+    labels = torch.cat(all_labels, dim=0).long()
+
+    class_ids, inverse = torch.unique(labels, sorted=True, return_inverse=True)
+    num_classes = class_ids.numel()
+
+    centroids = torch.zeros(num_classes, embeddings.size(1))
+    counts = torch.zeros(num_classes)
+    for emb, cls_idx in zip(embeddings, inverse):
+        centroids[cls_idx] += emb
+        counts[cls_idx] += 1
+    centroids /= counts.unsqueeze(1)
+    centroids = F.normalize(centroids, dim=1)
+
+    if num_classes == 1:
+        class_hardness = torch.ones(1)
+    else:
+        similarities = centroids @ centroids.T
+        similarities.fill_diagonal_(-1.0)
+        k = min(knn_k, num_classes - 1)
+        knn_similarities, _ = torch.topk(similarities, k=k, dim=1)
+        class_hardness = knn_similarities.mean(dim=1).clamp_min(0.0)
+        span = (class_hardness.max() - class_hardness.min()).item()
+        if span > 1e-6:
+            class_hardness = (class_hardness - class_hardness.min()) / span
+        else:
+            class_hardness = torch.zeros_like(class_hardness)
+
+    class_weights = 1.0 + hardness_scale * class_hardness
+    sample_weights = class_weights[inverse].double()
+    sampler = WeightedRandomSampler(
+        weights=sample_weights,
+        num_samples=len(sample_weights),
+        replacement=True,
+    )
+
+    return sampler, {
+        "num_classes": int(num_classes),
+        "mean_class_weight": float(class_weights.mean().item()),
+        "max_class_weight": float(class_weights.max().item()),
+    }
 
 
 @torch.no_grad()
@@ -105,34 +179,52 @@ def train(args):
     print(f"[Train] Using device: {device}")
 
     # -- Datasets -----------------------------------------------------------
-    full_dataset = CelebRetrievalDataset(
+    index_dataset = CelebRetrievalDataset(
         args.data_dir,
-        transform=get_train_transforms(image_size=224),
+        transform=None,
     )
-    num_classes = len(full_dataset.classes)
+    num_classes = len(index_dataset.classes)
     print(f"[Train] Number of identity classes: {num_classes}")
 
     # 90/10 train-val split (deterministic seed)
-    n_val   = max(1, int(0.10 * len(full_dataset)))
-    n_train = len(full_dataset) - n_val
-    train_set, val_set = random_split(
-        full_dataset, [n_train, n_val],
+    n_val   = max(1, int(0.10 * len(index_dataset)))
+    n_train = len(index_dataset) - n_val
+    train_indices, val_indices = random_split(
+        index_dataset, [n_train, n_val],
         generator=torch.Generator().manual_seed(42)
     )
-    # Use clean transforms for the val split
-    val_set.dataset = CelebRetrievalDataset(
+    train_indices = train_indices.indices
+    val_indices = val_indices.indices
+
+    train_dataset = CelebRetrievalDataset(
+        args.data_dir,
+        transform=get_train_transforms(image_size=224),
+    )
+    val_dataset = CelebRetrievalDataset(
         args.data_dir,
         transform=get_val_transforms(image_size=224),
     )
 
-    train_loader = DataLoader(
-        train_set, batch_size=args.batch_size,
-        shuffle=True, num_workers=args.num_workers,
-        pin_memory=True, drop_last=True,
+    train_set = Subset(train_dataset, train_indices)
+    val_set = Subset(val_dataset, val_indices)
+    mining_set = Subset(val_dataset, train_indices)
+
+    train_loader = make_epoch_loader(
+        train_set,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
     )
     val_loader = DataLoader(
         val_set, batch_size=args.batch_size,
         shuffle=False, num_workers=args.num_workers,
+        pin_memory=True,
+    )
+
+    mining_loader = DataLoader(
+        mining_set,
+        batch_size=args.mine_batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
         pin_memory=True,
     )
 
@@ -166,6 +258,27 @@ def train(args):
     # -- Training loop ------------------------------------------------------
     print(f"\n[Train] Starting training for {args.epochs} epochs\n")
     for epoch in range(args.epochs):
+        if epoch > 0 and epoch % args.mine_every == 0:
+            sampler, stats = build_hard_negative_sampler(
+                model,
+                mining_loader,
+                device,
+                knn_k=args.mine_knn,
+                hardness_scale=args.mine_strength,
+            )
+            train_loader = make_epoch_loader(
+                train_set,
+                batch_size=args.batch_size,
+                num_workers=args.num_workers,
+                sampler=sampler,
+            )
+            print(
+                f"[Mine] Refreshed sampler after epoch {epoch + 1}: "
+                f"{stats['num_classes']} identities, "
+                f"mean weight {stats['mean_class_weight']:.3f}, "
+                f"max weight {stats['max_class_weight']:.3f}"
+            )
+
         cosine_lr_schedule(
             optimizer, epoch, args.epochs,
             args.lr_backbone, args.lr_head, args.warmup_epochs
@@ -255,6 +368,14 @@ def parse_args():
     p.add_argument("--unfreeze_blocks",type=int, default=6,
                    help="Number of final ViT transformer blocks to unfreeze.")
     p.add_argument("--num_workers",    type=int, default=6)
+    p.add_argument("--mine_every",      type=int, default=5,
+                   help="Refresh hard-negative mining every N epochs.")
+    p.add_argument("--mine_knn",        type=int, default=5,
+                   help="K for the identity-level KNN graph.")
+    p.add_argument("--mine_strength",   type=float, default=2.0,
+                   help="Oversampling strength for hard identities.")
+    p.add_argument("--mine_batch_size", type=int, default=256,
+                   help="Batch size used when mining embeddings.")
     return p.parse_args()
 
 

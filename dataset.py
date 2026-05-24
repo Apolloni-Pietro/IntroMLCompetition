@@ -86,7 +86,7 @@ class CelebRetrievalDataset(Dataset):
             label_name = folder.name
             self.classes.append(label_name)
             self.class_to_idx[label_name] = idx
-            for img_path in folder.iterdir():
+            for img_path in sorted(folder.iterdir()):
                 if img_path.suffix.lower() in VALID_EXTS:
                     self.samples.append((str(img_path), idx))
 
