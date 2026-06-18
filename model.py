@@ -1,10 +1,10 @@
 """
-model.py — CLIP ViT-B/16 visual encoder fine-tuned with an ArcFace head.
+model.py — CLIP ViT-L/14 visual encoder fine-tuned with an ArcFace head.
 
 Architecture overview
 ---------------------
-  OpenCLIP ViT-B/16 visual encoder (partially unfrozen)
-      └─ 512-dim L2-normalised embedding
+  OpenCLIP ViT-L/14 visual encoder (partially unfrozen)
+      └─ 768-dim L2-normalised embedding
            └─ ArcFaceLoss head  (used only during training)
 
 At inference time only the encoder is used; the ArcFace head is discarded.
@@ -29,7 +29,7 @@ class ArcFaceLoss(nn.Module):
     Face Recognition", CVPR 2019.
 
     Args:
-        in_features:   Dimensionality of the input embedding (512 for ViT-B/16).
+        in_features:   Dimensionality of the input embedding (768 for ViT-L/14).
         num_classes:   Number of identity classes in the training set.
         s:             Feature scale (default 64). Controls the magnitude of
                        logits fed to cross-entropy.
@@ -87,7 +87,7 @@ class ArcFaceLoss(nn.Module):
 
 class CLIPArcFaceModel(nn.Module):
     """
-    CLIP ViT-B/16 visual encoder wrapped for metric learning.
+    CLIP ViT-L/14 visual encoder wrapped for metric learning.
 
     Unfreezes the last `unfreeze_blocks` transformer blocks plus the final
     LayerNorm and projection layer, keeping earlier blocks frozen to preserve

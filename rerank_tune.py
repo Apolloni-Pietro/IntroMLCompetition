@@ -19,6 +19,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, Subset, random_split
 
 from dataset import CelebRetrievalDataset, get_val_transforms
+from model import CLIPArcFaceModel
 from rerank import rerank_topk
 
 
@@ -30,49 +31,11 @@ def get_device():
     return torch.device("cpu")
 
 
-def load_model(checkpoint_path: str, device: torch.device) -> torch.nn.Module:
+def load_model(checkpoint_path: str, device: torch.device) -> CLIPArcFaceModel:
     ckpt = torch.load(checkpoint_path, map_location=device)
     num_classes = ckpt.get("num_classes")
-    state_dict = ckpt["model_state_dict"]
-
-    arcface_weight = state_dict.get("arcface.weight")
-    if arcface_weight is None:
-        raise KeyError("Checkpoint is missing 'arcface.weight', so the model family cannot be inferred.")
-
-    embed_dim = arcface_weight.shape[1]
-    from other_models import build_model
-
-    if embed_dim == 512:
-        model = build_model(
-            num_classes=num_classes,
-            model_name="ViT-B-16",
-            pretrained="openai",
-            embed_dim=512,
-            unfreeze_blocks=6,
-            device=str(device),
-        )
-    elif embed_dim == 768:
-        model = build_model(
-            num_classes=num_classes,
-            model_name="ViT-L-14",
-            pretrained="openai",
-            embed_dim=768,
-            unfreeze_blocks=6,
-            device=str(device),
-        )
-    elif embed_dim == 1024:
-        model = build_model(
-            num_classes=num_classes,
-            model_name="hf-hub:apple/DFN5B-CLIP-ViT-H-14",
-            pretrained="",
-            embed_dim=1024,
-            unfreeze_blocks=6,
-            device=str(device),
-        )
-    else:
-        raise RuntimeError(f"Unsupported checkpoint embedding dimension: {embed_dim}")
-
-    model.load_state_dict(state_dict)
+    model = CLIPArcFaceModel(num_classes=num_classes, unfreeze_blocks=6)
+    model.load_state_dict(ckpt["model_state_dict"])
     model.to(device)
     model.eval()
     return model

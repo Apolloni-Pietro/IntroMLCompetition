@@ -1,199 +1,115 @@
-# Celebrity Retrieval Across Domains — Action Plan
+# Team AAA - Celebrity Retrieval Across Domains
 
-## 1. Problem Analysis
+Cross-domain image retrieval competition for the Introduction to Machine Learning course at UniTN. Given natural photo **queries**, retrieve the matching **synthetic gallery images** of the same celebrity identity.
 
-### Core Challenge
-
-Cross-domain image retrieval: **natural photo queries → synthetic gallery images**.
-This is harder than standard face recognition because:
-
-- Domain gap: real textures/lighting vs synthetic generation artifacts
-- No fixed identity set at test time (retrieval, not classification)
-- Evaluation rewards ranking quality (top-1, top-5, top-10)
-
-### Why ResNet50 (baseline) Is Weak Here
-
-- ImageNet features capture object-level semantics, not face identity
-- No fine-tuning → no adaptation to celebrity identities
-- No domain-gap handling
-- Expected accuracy: ~20–35% top-1
+Scoring: top-1 (×6) + top-5 (×3) + top-10 (×1), max 1000 pts.
 
 ---
 
-## 2. Proposed Solution: CLIP ViT-B/16 + ArcFace Fine-Tuning
+## Approach
 
-### Model Choice: OpenCLIP ViT-B/16
-
-**Why CLIP over pure CNN or pure face models?**
-
-| Property                 | ResNet50 | ArcFace (MS1M) | CLIP ViT-B/16 (ours)   |
-| ------------------------ | -------- | -------------- | ---------------------- |
-| Pre-training data        | ImageNet | 5M face images | 400M image–text pairs  |
-| Domain robustness        | Low      | Medium         | **High**               |
-| Handles synthetic images | No       | Partly         | **Yes**                |
-| Fine-tuning potential    | Medium   | Good           | **Excellent**          |
-| Embedding quality        | General  | Face-specific  | **General + identity** |
-
-CLIP was trained on internet-scale data that includes AI-generated content, artistic portraits,
-and illustrations — exactly the domain of the synthetic gallery. Its ViT architecture also has
-stronger global attention than CNNs, which is critical for identity matching when style/texture
-differ.
-
-### Fine-Tuning Strategy
-
-**Objective**: Add ArcFace loss on top of frozen-then-gradually-unfrozen CLIP visual encoder.
+**OpenCLIP ViT-L/14** fine-tuned with **ArcFace** metric learning loss, followed by **k-Reciprocal re-ranking** at inference.
 
 ```
-CLIP ViT-B/16 Visual Encoder (partially unfrozen)
+OpenCLIP ViT-L/14 visual encoder  (last 6 blocks unfrozen)
         ↓
-  L2-normalized 512-dim embedding
-        ↓
-  ArcFace Classification Head (512 → N_identities)
-        ↓
-  ArcFace loss (s=64, m=0.5) + Cross-Entropy
+  L2-normalised 768-dim embedding
+        ↓  (training only)
+  ArcFace head  (s=64, m=0.5)
 ```
 
-**What we unfreeze** (to stay within time budget):
-
-- Final 6 transformer blocks (out of 12)
-- Final LayerNorm
-- Projection layer
-
-This gives ~40M trainable parameters vs. 86M total — fast training but deep adaptation.
+At inference, only the encoder is used. Embeddings from 6 TTA views are averaged and re-normalised before retrieval.
 
 ---
 
-## 3. Training Recipe
+## Data Layout
 
-### Data Augmentation (domain-gap-aware)
-
-```
-Training transforms:
-  - RandomResizedCrop(224, scale=(0.65, 1.0))
-  - RandomHorizontalFlip(p=0.5)
-  - ColorJitter(brightness=0.3, contrast=0.3, saturation=0.2, hue=0.05)
-  - RandomGrayscale(p=0.1)        # bridges color domain gap
-  - RandomApply(GaussianBlur)     # simulates generation blur
-  - Normalize(CLIP mean/std)
-```
-
-### Hyperparameters
-
-| Parameter       | Value                         | Rationale                       |
-| --------------- | ----------------------------- | ------------------------------- |
-| Backbone LR     | 1e-5                          | Small to preserve CLIP features |
-| Head LR         | 1e-4                          | Larger for ArcFace head         |
-| Batch size      | 128                           | Fills V100 16GB comfortably     |
-| Epochs          | 50                            | ~1.5h on V100 with 5K images    |
-| Scheduler       | Cosine with warmup (5 epochs) | Standard for transformers       |
-| ArcFace s       | 64.0                          | Standard scale                  |
-| ArcFace m       | 0.50                          | Standard margin                 |
-| Weight decay    | 1e-4                          | Regularization                  |
-| Mixed precision | FP16 (torch.cuda.amp)         | Speed + memory                  |
-
-### Estimated Training Time on V100 16GB
-
-- ~5,000 images / batch 128 = ~39 steps/epoch
-- 50 epochs × 39 steps = ~1,950 steps
-- ~1.5–2 hours total ✅ (well within 5h budget)
-
-This leaves room to:
-
-- Train ViT-L/14 variant (~3h additional)
-- Experiment with re-ranking hyperparameters
-
----
-
-## 4. Inference Pipeline
+**Training** (`CelebRetrievalDataset`):
 
 ```
-Query images              Gallery images
-     ↓                          ↓
-  CLIP encoder            CLIP encoder
-     ↓                          ↓
-  L2 normalize            L2 normalize
-     ↓                          ↓
-         Cosine similarity matrix
-                  ↓
-         k-Reciprocal Re-Ranking
-                  ↓
-         Top-10 ranked gallery list
-                  ↓
-              Submit
+train_data/
+├── identity_name_1/
+│   ├── img_a.jpg
+│   └── img_b.jpg
+└── identity_name_2/
+    └── ...
 ```
 
-### Re-Ranking: k-Reciprocal Encoding (Zhong et al., 2017)
-
-This post-processing step is crucial and often gives **+5–10% absolute** improvement
-on retrieval benchmarks with zero additional training.
-
-The key idea: two images are more likely to be the same person if they appear in each
-other's k-nearest-neighbor lists (mutual nearest neighbors).
-
-**Expected gain**: top-1 accuracy +6–12% over raw cosine similarity.
-
----
-
-## 5. Expected Performance
-
-| Method                             | Est. Top-1  | Est. Top-5  | Est. Top-10 |
-| ---------------------------------- | ----------- | ----------- | ----------- |
-| ResNet50 (baseline)                | ~25%        | ~45%        | ~55%        |
-| CLIP ViT-B/16 (zero-shot)          | ~45%        | ~65%        | ~72%        |
-| **CLIP ViT-B/16 + ArcFace (ours)** | ~70–78%     | ~87–92%     | ~93–96%     |
-| + Re-ranking                       | **~76–84%** | **~90–95%** | **~95–98%** |
-
-Score estimate (out of 1000):
-
-- Top-1 ~80% → 480 pts, Top-5 ~92% → 276 pts, Top-10 ~96% → 96 pts
-- **Total ≈ 852/1000**
-
----
-
-## 6. File Structure
+**Test** (`FolderImageDataset`):
 
 ```
-competition/
-├── ACTION_PLAN.md          ← this file
-├── dataset.py              ← Dataset class + augmentations
-├── model.py                ← CLIP + ArcFace architecture
-├── train.py                ← Training loop
-├── inference.py            ← Embedding extraction + retrieval
-├── rerank.py               ← k-Reciprocal re-ranking
-└── submit.py               ← Full inference + submission pipeline
+test_data/
+├── query/    ← real photos
+└── gallery/  ← synthetic images
 ```
 
 ---
 
-## 7. Step-by-Step Execution Guide
+## Usage
+
+### 1. Install dependencies
 
 ```bash
-# 1. Install dependencies
 pip install open_clip_torch timm tqdm Pillow requests
-
-# 2. Train the model
-python train.py \
-  --data_dir /path/to/train \
-  --output_dir ./checkpoints \
-  --epochs 50 \
-  --batch_size 128
-
-# 3. Run inference and submit
-python submit.py \
-  --checkpoint ./checkpoints/best_model.pth \
-  --data_dir /path/to/test_data \
-  --groupname "YourTeamName" \
-  --url http://localhost:3001/retrieval/ \
-  --rerank  # enable k-reciprocal re-ranking
 ```
+
+### 2. Train
+
+```bash
+python train.py \
+    --data_dir /path/to/train \
+    --output_dir ./checkpoints \
+    --epochs 50 \
+    --batch_size 64
+```
+
+Key training flags:
+| Flag | Default | Description |
+|---|---|---|
+| `--lr_backbone` | 1e-5 | LR for unfrozen ViT blocks |
+| `--lr_head` | 1e-4 | LR for ArcFace head |
+| `--unfreeze_blocks` | 6 | Number of final transformer blocks to unfreeze |
+| `--warmup_epochs` | 5 | Linear LR warmup length |
+
+Saves `checkpoints/best_model.pth` (best val centroid-NN accuracy) and periodic `ckpt_epochXXX.pth` every 10 epochs.
+
+### 3. (Optional) Tune re-ranking hyperparameters
+
+```bash
+python rerank_tune.py \
+    --checkpoint ./checkpoints/best_model.pth \
+    --data_dir /path/to/train \
+    --batch_size 256 \
+    --k1 15 20 25 \
+    --k2 4 6 8 \
+    --lam 0.2 0.3 0.4
+```
+
+Runs a grid search over `(k1, k2, lam)` on the validation split and prints the best combination.
+
+### 4. Submit
+
+```bash
+python submit.py \
+    --checkpoint ./checkpoints/best_model.pth \
+    --data_dir /path/to/test_data \
+    --groupname "Team AAA" \
+    --url http://videosim.disi.unitn.it:3001/retrieval/ \
+    --rerank \
+    --k1 20 --k2 6 --lam 0.3
+```
+
+Drop `--rerank` for faster (slightly lower accuracy) cosine-similarity-only retrieval.
 
 ---
 
-## 8. Possible Further Improvements (if budget allows)
+## File Overview
 
-1. **ViT-L/14 backbone**: larger model, +3–5% accuracy, ~3× slower training
-2. **Curriculum hard-negative mining**: mine hardest negatives within batch for ArcFace
-3. **Test-Time Augmentation (TTA)**: average embeddings from multiple augmented views
-4. **Domain Adversarial Training**: add a domain discriminator loss to explicitly bridge real/synthetic gap
-5. **Ensemble**: average embeddings from CLIP ViT-B/16 + a fine-tuned InsightFace model
-6. **Query Expansion (DBA/AQE)**: expand query embedding with weighted average of top-k neighbors
+| File             | Purpose                                                                                       |
+| ---------------- | --------------------------------------------------------------------------------------------- |
+| `model.py`       | `CLIPArcFaceModel` + `ArcFaceLoss`                                                            |
+| `dataset.py`     | `CelebRetrievalDataset` (train) and `FolderImageDataset` (inference) + augmentation pipelines |
+| `train.py`       | Training loop with FP16, cosine LR schedule, checkpointing                                    |
+| `rerank.py`      | k-Reciprocal encoding re-ranking (Zhong et al., CVPR 2017)                                    |
+| `rerank_tune.py` | Grid-search tuning of re-ranking hyperparameters on val split                                 |
+| `submit.py`      | TTA embedding extraction + retrieval + HTTP submission                                        |

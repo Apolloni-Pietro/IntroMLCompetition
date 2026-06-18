@@ -1,2 +1,8 @@
-.DS_Store #MacOS system file
-.new_comp/ # Python environment folder
+#MacOS system file
+.DS_Store 
+
+# Python environment folder
+.new_comp/ 
+
+# Agent files
+CLAUDE.md
