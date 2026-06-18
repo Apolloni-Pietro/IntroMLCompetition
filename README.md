@@ -66,9 +66,9 @@ python train.py \
 Key training flags:
 | Flag | Default | Description |
 |---|---|---|
-| `--lr_backbone` | 1e-5 | LR for unfrozen ViT blocks |
-| `--lr_head` | 1e-4 | LR for ArcFace head |
-| `--unfreeze_blocks` | 6 | Number of final transformer blocks to unfreeze |
+| `--lr_backbone` | 5e-6 | LR for unfrozen ViT blocks |
+| `--lr_head` | 5e-5 | LR for ArcFace head |
+| `--unfreeze_blocks` | 4 | Number of final transformer blocks to unfreeze |
 | `--warmup_epochs` | 5 | Linear LR warmup length |
 
 Saves `checkpoints/best_model.pth` (best val centroid-NN accuracy) and periodic `ckpt_epochXXX.pth` every 10 epochs.
@@ -113,3 +113,4 @@ Drop `--rerank` for faster (slightly lower accuracy) cosine-similarity-only retr
 | `rerank.py`      | k-Reciprocal encoding re-ranking (Zhong et al., CVPR 2017)                                    |
 | `rerank_tune.py` | Grid-search tuning of re-ranking hyperparameters on val split                                 |
 | `submit.py`      | TTA embedding extraction + retrieval + HTTP submission                                        |
+| `visualize_predictions.py` | Extract visualizations for the final report
